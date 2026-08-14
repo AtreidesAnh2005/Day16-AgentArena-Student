@@ -72,6 +72,43 @@ from __future__ import annotations
 
 from harness.middleware import Middleware
 
+#: Liên từ dán hai nửa câu mâu thuẫn lại — xem `arena.model._final_payload`.
+_JOINER = " và "
+
+NO_EVIDENCE_ANSWER = (
+    "Không đủ căn cứ để trả lời: không có bằng chứng nào hỗ trợ các claim đã nêu."
+)
+
+
+def _owning_doc_id(ctx, text: str) -> str | None:
+    for doc in ctx.corpus.docs:
+        if text in doc.body:
+            return doc.doc_id
+    return None
+
+
+def _split_fused_claim(ctx, text: str):
+    """Hai nửa DO MÔ HÌNH VIẾT, dán bằng `_JOINER`, mỗi nửa thuộc một tài
+    liệu khác nhau — hoặc `None` nếu không điểm nối nào thoả cả hai điều
+    kiện. Câu ghép có thể chứa `_JOINER` nhiều lần (kể cả trùng lặp do
+    điểm cắt `_FUSE_CHARS` rơi ngay trước một "và" có sẵn trong câu gốc),
+    nên thử LẦN LƯỢT từng vị trí thay vì chỉ vị trí đầu tiên."""
+    start = 0
+    while True:
+        idx = text.find(_JOINER, start)
+        if idx == -1:
+            return None
+        left, right = text[:idx], text[idx + len(_JOINER) :]
+        if left and right and ctx.saw(left) and ctx.saw(right):
+            left_doc = _owning_doc_id(ctx, left)
+            right_doc = _owning_doc_id(ctx, right)
+            if left_doc and right_doc and left_doc != right_doc:
+                return [
+                    {"text": left, "doc_id": left_doc},
+                    {"text": right, "doc_id": right_doc},
+                ]
+        start = idx + 1
+
 
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
@@ -79,16 +116,42 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept: list[dict] = []
+        spliced = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue  # MALFORMED — bỏ, không phải việc critic sửa
+            text = claim.get("text")
+            if not isinstance(text, str):
+                continue
+            if ctx.saw(text):
+                kept.append(claim)  # giữ nguyên, không sửa chữ
+                continue
+            halves = _split_fused_claim(ctx, text)
+            if halves is not None:
+                kept.extend(halves)
+                spliced = True
+            # không tách được -> bịa: bỏ claim, không append
+
+        report = dict(report)
+        if not kept:
+            report["claims"] = []
+            report["citations"] = []
+            report["abstain"] = True
+            report["answer"] = NO_EVIDENCE_ANSWER
+            return report
+
+        if spliced:
+            report["abstain"] = True
+        report["claims"] = kept
+        citations: list[str] = []
+        for claim in kept:
+            doc_id = claim.get("doc_id")
+            if isinstance(doc_id, str) and doc_id not in citations:
+                citations.append(doc_id)
+        report["citations"] = citations
+        return report
