@@ -62,22 +62,60 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+def _line_match(text: str, body: str) -> bool:
+    """`text` có phải bản sao nguyên văn của một DÒNG trong `body` không —
+    cùng định nghĩa `arena.scorer._supports` dùng để chấm điểm (khớp
+    trong MỘT dòng, không phải `text in body` cả khối)."""
+    return any(text in line for line in body.splitlines())
+
+
 class CitationChecker(Middleware):
     """Trỏ mỗi claim về đúng tài liệu thật sự chứa câu đó."""
 
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        fixed: list = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                fixed.append(claim)
+                continue
+            text = claim.get("text")
+            doc_id = claim.get("doc_id")
+            if not isinstance(text, str) or not text:
+                fixed.append(claim)
+                continue
+
+            current = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+            if current is not None and _line_match(text, current.body):
+                fixed.append(claim)  # trích dẫn đã đúng, giữ nguyên
+                continue
+
+            source = None
+            for doc in ctx.corpus.docs:
+                if doc.body in ctx.observed_text and _line_match(text, doc.body):
+                    source = doc
+                    break
+
+            if source is None:
+                fixed.append(claim)  # không tìm được nguồn -> để critic xử lý
+                continue
+
+            new_claim = dict(claim)
+            new_claim["doc_id"] = source.doc_id
+            fixed.append(new_claim)
+
+        report = dict(report)
+        report["claims"] = fixed
+        citations: list[str] = []
+        for claim in fixed:
+            if isinstance(claim, dict):
+                cid = claim.get("doc_id")
+                if isinstance(cid, str) and cid not in citations:
+                    citations.append(cid)
+        report["citations"] = sorted(citations)
+        return report
