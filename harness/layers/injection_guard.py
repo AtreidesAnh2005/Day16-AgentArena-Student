@@ -47,12 +47,35 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
 BLOCK_START = "--- LƯU Ý HỆ THỐNG"
 BLOCK_END = "--- HẾT LƯU Ý HỆ THỐNG ---"
 PLACEHOLDER = "[nội dung không đáng tin cậy đã bị loại bỏ]"
+
+
+def _strip_blocks(text: str) -> str:
+    """`text` với mọi đoạn BLOCK_START..BLOCK_END (hoặc BLOCK_START tới hết
+    chuỗi, nếu bị cắt giữa chừng) thay bằng PLACEHOLDER."""
+    out = []
+    rest = text
+    while True:
+        start = rest.find(BLOCK_START)
+        if start == -1:
+            out.append(rest)
+            break
+        out.append(rest[:start])
+        out.append(PLACEHOLDER)
+        end = rest.find(BLOCK_END, start)
+        if end == -1:
+            rest = ""
+        else:
+            rest = rest[end + len(BLOCK_END) :]
+    return "".join(out)
 
 
 class InjectionGuard(Middleware):
@@ -62,17 +85,14 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if BLOCK_START not in result.content:
+            return result
+        cleaned = _strip_blocks(result.content)
+        return ToolResult(ok=result.ok, content=cleaned, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        answer = report.get("answer")
+        if isinstance(answer, str) and INJECTION_CANARY in answer:
+            report = dict(report)
+            report["answer"] = answer.replace(INJECTION_CANARY, "").strip()
+        return report
